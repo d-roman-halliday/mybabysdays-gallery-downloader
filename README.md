@@ -2,7 +2,7 @@
 
 Python image scraper for mybabysdays.com
 
-Supersimple script to scrape the website (after logging in with your credentials) and downloading all the galery images it finds.
+Super simple script to scrape the website (after logging in with your credentials) and downloading all the galery images it finds. One can use the bulk download option built into the website but this will allow getting just the latest images quickly.
 
 ## Usage
 To use this, set your credentials in: `config.json`
