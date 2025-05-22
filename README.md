@@ -16,3 +16,10 @@ python mybabysdays-gallery-downloader.py
 To control/limit how far back the script goes, use these variables (whichever is hit first stops the process):
  * `MAX_DAYS_BACK` = how many days back to fetch (0 to just keep going until MIN_DATE is hit)
  * `MIN_DATE` = date of the last date to fetch
+
+# Tracking Config
+
+Git doesn't allow for files to be frozen globaly (tried using `.gitignore`). The best thing is to prevent local changes being tracked:
+```
+git update-index --assume-unchanged config.json
+```
