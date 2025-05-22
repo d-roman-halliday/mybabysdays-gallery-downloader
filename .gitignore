@@ -1,6 +1,9 @@
 # Project stuff
 downloaded_images/
 
+# Prevent pushing changes to config file (containing credentials)
+config.json
+
 # IDE
 .idea/
 
