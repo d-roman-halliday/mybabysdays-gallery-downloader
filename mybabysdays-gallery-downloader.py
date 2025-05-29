@@ -58,7 +58,7 @@ def login():
     except requests.exceptions.ConnectionError as e:
         raise ConnectionError(f"Failed to connect to {LOGIN_URL}. Please check your internet connection and the domain name. Error: {e}")
     except requests.exceptions.HTTPError as e:
-        raise Exception(f"HTTP error during login page retrieval: {e}")
+        raise Exception(f"HTTP error during login page retrieval: {e} \nCheck the domain is correct: {DOMAIN}")
     except requests.exceptions.Timeout:
         raise ConnectionError(f"Connection to {LOGIN_URL} timed out.")
 
