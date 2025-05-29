@@ -18,13 +18,12 @@ DOMAIN = config['DOMAIN']
 USERNAME = config['USERNAME']
 PASSWORD = config['PASSWORD']
 
-# set to 0 for all
-MAX_DAYS_BACK = 10
-MIN_DATE = '01/01/2025'
+# Configuration with defaults from config.json or hardcoded values
+MAX_DAYS_BACK = config.get('MAX_DAYS_BACK', 10)  # Default to 10 if not in config
+MIN_DATE = config.get('MIN_DATE', '01/01/2025')  # Default to '01/01/2025' if not in config
+DOWNLOAD_ROOT_FOLDER = config.get('DOWNLOAD_ROOT_FOLDER', 'downloaded_images') # Default to 'downloaded_images' if not in config
 
-DOWNLOAD_ROOT_FOLDER = 'downloaded_images'
-
-# Global Configuration
+# Global Configuration (these remain hardcoded as they're not intended for config file)
 LOGIN_URL = 'https://' + DOMAIN + '.mybabysdays.com/user/home'
 IMAGE_BASE = '/images/sted/gallery_image/'
 HOME_PAGE_URL = 'https://' + DOMAIN + '.mybabysdays.com/component/sted_parent/diary/main'

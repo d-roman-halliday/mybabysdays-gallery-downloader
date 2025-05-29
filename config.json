@@ -1,5 +1,8 @@
 {
   "DOMAIN": "yourdomain",
   "USERNAME": "your_username",
-  "PASSWORD": "your_password"
+  "PASSWORD": "your_password",
+  "MAX_DAYS_BACK": 10,
+  "MIN_DATE": "01/01/2025",
+  "DOWNLOAD_ROOT_FOLDER": "downloaded_images"
 }
