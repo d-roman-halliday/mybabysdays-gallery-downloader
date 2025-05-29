@@ -6,6 +6,10 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 
+# Define a custom exception for credential errors
+class CredentialError(Exception):
+    pass
+
 # Load configuration from config.json
 with open('config.json', 'r') as f:
     config = json.load(f)
@@ -30,7 +34,6 @@ session = requests.Session()
 def clean_folder_name(name):
     return re.sub(r'[\\/*?:"<>|]', "_", name)
 
-
 def extract_and_reformat_date(text):
     # Match date pattern like '2nd March 2025'
     match = re.search(
@@ -48,13 +51,28 @@ def extract_and_reformat_date(text):
     return parsed_date.strftime('%Y-%m-%d')
 
 def login():
-    # Get the login page first to get any hidden form fields
-    login_page = session.get(LOGIN_URL)
+    try:
+        # Get the login page first to get any hidden form fields
+        login_page = session.get(LOGIN_URL, timeout=10)
+        login_page.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+    except requests.exceptions.ConnectionError as e:
+        raise ConnectionError(f"Failed to connect to {LOGIN_URL}. Please check your internet connection and the domain name. Error: {e}")
+    except requests.exceptions.HTTPError as e:
+        raise Exception(f"HTTP error during login page retrieval: {e}")
+    except requests.exceptions.Timeout:
+        raise ConnectionError(f"Connection to {LOGIN_URL} timed out.")
+
+
     soup = BeautifulSoup(login_page.text, 'html.parser')
 
     # Find the login form, adapt as needed
     form = soup.find('form')
+    if not form:
+        raise Exception("Login form not found on the page. The website structure might have changed.")
+
     action = form.get('action')
+    if not action:
+        raise Exception("Login form action URL not found.")
     login_action_url = urljoin(LOGIN_URL, action)
 
     payload = {
@@ -66,22 +84,59 @@ def login():
     for hidden in form.find_all('input', {'type': 'hidden'}):
         payload[hidden.get('name')] = hidden.get('value')
 
-    response = session.post(login_action_url, data=payload)
+    try:
+        response = session.post(login_action_url, data=payload, timeout=10)
+        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+    except requests.exceptions.ConnectionError as e:
+        raise ConnectionError(f"Failed to connect to {login_action_url} during login attempt. Error: {e}")
+    except requests.exceptions.HTTPError as e:
+        # If login fails due to incorrect credentials, it often results in a redirect back to login
+        # or a 200 OK with an error message on the page. We need to check the content.
+        if "Incorrect username or password" in response.text or "login failed" in response.text.lower():
+            raise CredentialError("Login failed. Incorrect username or password.")
+        else:
+            raise Exception(f"HTTP error during login submission: {e}")
+    except requests.exceptions.Timeout:
+        raise ConnectionError(f"Login attempt to {login_action_url} timed out.")
+
 
     # Basic login success check
-    if "logout" not in response.text.lower():
-        raise Exception("Login failed. Check credentials or login mechanism.")
+    # Check for elements present on the post-login page, and absence of login form
+    if "logout" not in response.text.lower() and "dashboard" not in response.text.lower(): # Assuming "dashboard" appears on successful login
+        # If the login form is still present, it likely means login failed
+        if soup.find('form') and soup.find('form').find('input', {'name': 'username'}):
+            raise CredentialError("Login failed. Incorrect username or password, or an issue with the login process.")
+        else:
+            raise Exception("Login failed. Could not confirm successful login. The website structure might have changed.")
 
+    print("Login successful.")
     return response
 
 
 def download_images_from_page(url):
     print(f"Processing: {url}")
-    response = session.get(url)
+    try:
+        response = session.get(url, timeout=10)
+        response.raise_for_status()
+    except requests.exceptions.ConnectionError as e:
+        print(f"Warning: Failed to connect to {url}. Skipping this page. Error: {e}")
+        return None
+    except requests.exceptions.HTTPError as e:
+        print(f"Warning: HTTP error accessing {url}. Skipping this page. Error: {e}")
+        return None
+    except requests.exceptions.Timeout:
+        print(f"Warning: Connection to {url} timed out. Skipping this page.")
+        return None
+
     soup = BeautifulSoup(response.text, 'html.parser')
 
     title = soup.title.string if soup.title else "Untitled"
-    formatted_date = extract_and_reformat_date(title.strip())
+    try:
+        formatted_date = extract_and_reformat_date(title.strip())
+    except ValueError as e:
+        print(f"Warning: Could not extract date from page title '{title}'. Skipping this page. Error: {e}")
+        return None
+
     folder_name = clean_folder_name(formatted_date)
     download_location = os.path.join(DOWNLOAD_ROOT_FOLDER, folder_name)
 
@@ -107,10 +162,20 @@ def download_images_from_page(url):
             os.makedirs(download_location, exist_ok=True)
 
             if not os.path.exists(filepath):
-                img_data = session.get(img_url).content
-                with open(filepath, 'wb') as f:
-                    f.write(img_data)
-                count += 1
+                try:
+                    img_data = session.get(img_url, timeout=10).content
+                    with open(filepath, 'wb') as f:
+                        f.write(img_data)
+                    count += 1
+                except requests.exceptions.ConnectionError as e:
+                    print(f"Warning: Failed to download {img_url}. Connection error: {e}")
+                except requests.exceptions.HTTPError as e:
+                    print(f"Warning: HTTP error downloading {img_url}: {e}")
+                except requests.exceptions.Timeout:
+                    print(f"Warning: Download of {img_url} timed out.")
+                except Exception as e:
+                    print(f"Warning: An unexpected error occurred while downloading {img_url}: {e}")
+
     print(f"Downloaded {count} images to {folder_name}")
 
     # Find "Prev" button, get URL
@@ -140,5 +205,12 @@ def crawl_images(start_url):
             break
 
 if __name__ == '__main__':
-    login()
-    crawl_images(HOME_PAGE_URL)
+    try:
+        login()
+        crawl_images(HOME_PAGE_URL)
+    except ConnectionError as e:
+        print(f"Fatal Connection Error: {e}")
+    except CredentialError as e:
+        print(f"Authentication Error: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
