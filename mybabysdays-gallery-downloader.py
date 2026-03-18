@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
+from requests.cookies import create_cookie
 
 # Define a custom exception for credential errors
 class CredentialError(Exception):
@@ -26,9 +27,83 @@ DOWNLOAD_ROOT_FOLDER = config.get('DOWNLOAD_ROOT_FOLDER', 'downloaded_images') #
 # Global Configuration (these remain hardcoded as they're not intended for config file)
 LOGIN_URL = 'https://' + DOMAIN + '.mybabysdays.com/user/home'
 IMAGE_BASE = '/images/sted/gallery_image/'
+VIDEO_BASE = f'mybabysdays.com/video_path/'
 HOME_PAGE_URL = 'https://' + DOMAIN + '.mybabysdays.com/component/sted_parent/diary/main'
 
 session = requests.Session()
+session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+})
+
+
+def ensure_cross_subdomain_cookies():
+    """
+    Copy host-only cookies to .mybabysdays.com so requests to videovm*.mybabysdays.com
+    can reuse the authenticated session.
+    """
+    cloned = 0
+    cookies_snapshot = list(session.cookies)
+    for cookie in cookies_snapshot:
+        if not cookie.domain:
+            continue
+
+        domain = cookie.domain.lstrip(".")
+        if not domain.endswith(".mybabysdays.com"):
+            continue
+
+        # Cookie is host-only for <tenant>.mybabysdays.com. Clone it for parent domain.
+        if cookie.domain == domain and domain.count(".") >= 2:
+            parent_cookie = create_cookie(
+                name=cookie.name,
+                value=cookie.value,
+                domain=".mybabysdays.com",
+                path=cookie.path or "/",
+                secure=cookie.secure,
+                expires=cookie.expires,
+                rest=getattr(cookie, "_rest", {}),
+            )
+            session.cookies.set_cookie(parent_cookie)
+            cloned += 1
+
+    if cloned:
+        print(f"Extended {cloned} auth cookie(s) to .mybabysdays.com")
+
+
+def download_media_file(media_url, filepath, page_url):
+    media_headers = {
+        "Accept": "video/webm,video/mp4,application/octet-stream,*/*;q=0.8",
+        "Referer": page_url,
+        "Origin": f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}",
+    }
+
+    try:
+        media_request = session.get(media_url, headers=media_headers, timeout=30)
+        media_request.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+
+        content_type = (media_request.headers.get("Content-Type") or "").lower()
+        body_prefix = media_request.content[:512].decode("utf-8", errors="ignore").lower()
+        if "text/html" in content_type or "<h1>403 forbidden</h1>" in body_prefix:
+            print(f"Warning: Access denied for media URL: {media_url}")
+            return False
+
+        with open(filepath, 'wb') as f:
+            f.write(media_request.content)
+        return True
+    except requests.exceptions.ConnectionError as e:
+        print(f"Warning: Failed to download {media_url}. Connection error: {e}")
+    except requests.exceptions.HTTPError as e:
+        print(f"Warning: HTTP error downloading {media_url}: {e}")
+    except requests.exceptions.Timeout:
+        print(f"Warning: Download of {media_url} timed out.")
+    except Exception as e:
+        print(f"Warning: An unexpected error occurred while downloading {media_url}: {e}")
+
+    return False
 
 def clean_folder_name(name):
     return re.sub(r'[\\/*?:"<>|]', "_", name)
@@ -60,7 +135,6 @@ def login():
         raise Exception(f"HTTP error during login page retrieval: {e} \nCheck the domain is correct: {DOMAIN}")
     except requests.exceptions.Timeout:
         raise ConnectionError(f"Connection to {LOGIN_URL} timed out.")
-
 
     soup = BeautifulSoup(login_page.text, 'html.parser')
 
@@ -101,18 +175,22 @@ def login():
 
     # Basic login success check
     # Check for elements present on the post-login page, and absence of login form
+    response_soup = BeautifulSoup(response.text, 'html.parser')
     if "logout" not in response.text.lower() and "dashboard" not in response.text.lower(): # Assuming "dashboard" appears on successful login
         # If the login form is still present, it likely means login failed
-        if soup.find('form') and soup.find('form').find('input', {'name': 'username'}):
+        if response_soup.find('form') and response_soup.find('form').find('input', {'name': 'username'}):
             raise CredentialError("Login failed. Incorrect username or password, or an issue with the login process.")
         else:
             raise Exception("Login failed. Could not confirm successful login. The website structure might have changed.")
+
+    # Re-scope host-only cookies to root domain for cross-subdomain media hosts.
+    ensure_cross_subdomain_cookies()
 
     print("Login successful.")
     return response
 
 
-def download_images_from_page(url):
+def download_media_from_page(url):
     print(f"Processing: {url}")
     try:
         response = session.get(url, timeout=10)
@@ -152,30 +230,23 @@ def download_images_from_page(url):
 
         # Parse links, and download if it's a gallery image
         href = link['href']
-        if href.startswith(IMAGE_BASE):
-            img_url = urljoin(url, href)
-            filename = os.path.basename(urlparse(img_url).path)
+        if (href.startswith(IMAGE_BASE) or VIDEO_BASE in href):
+            if href.startswith(IMAGE_BASE):
+                media_url = urljoin(url, href) # Link for images doesn't include base
+            else:
+                media_url = href # Link for videos has whole other subdomain
+
+            filename = os.path.basename(urlparse(media_url).path)
             filepath = os.path.join(download_location, filename)
 
             #Create dir if not exists
             os.makedirs(download_location, exist_ok=True)
 
             if not os.path.exists(filepath):
-                try:
-                    img_data = session.get(img_url, timeout=10).content
-                    with open(filepath, 'wb') as f:
-                        f.write(img_data)
+                if download_media_file(media_url, filepath, url):
                     count += 1
-                except requests.exceptions.ConnectionError as e:
-                    print(f"Warning: Failed to download {img_url}. Connection error: {e}")
-                except requests.exceptions.HTTPError as e:
-                    print(f"Warning: HTTP error downloading {img_url}: {e}")
-                except requests.exceptions.Timeout:
-                    print(f"Warning: Download of {img_url} timed out.")
-                except Exception as e:
-                    print(f"Warning: An unexpected error occurred while downloading {img_url}: {e}")
 
-    print(f"Downloaded {count} images to {folder_name}")
+    print(f"Downloaded {count} media file(s) to {folder_name}")
 
     # Find "Prev" button, get URL
     prev_link = soup.find('a', title="View the Previous Month.")
@@ -185,7 +256,7 @@ def download_images_from_page(url):
 
     return None
 
-def crawl_images(start_url):
+def crawl_media(start_url):
     next_url = start_url
     hit_min_date = False
     days_back = 0
@@ -196,7 +267,7 @@ def crawl_images(start_url):
     ):
         if MIN_DATE in next_url: hit_min_date = True
 
-        next_url = download_images_from_page(next_url)
+        next_url = download_media_from_page(next_url)
         days_back += 1
 
         if hit_min_date:
@@ -206,7 +277,7 @@ def crawl_images(start_url):
 if __name__ == '__main__':
     try:
         login()
-        crawl_images(HOME_PAGE_URL)
+        crawl_media(HOME_PAGE_URL)
     except ConnectionError as e:
         print(f"Fatal Connection Error: {e}")
     except CredentialError as e:
