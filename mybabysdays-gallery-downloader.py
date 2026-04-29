@@ -1,8 +1,9 @@
 import os
 import re
+import shutil
 import requests
 import json
-from datetime import datetime
+from datetime import datetime, date
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from requests.cookies import create_cookie
@@ -23,12 +24,31 @@ PASSWORD = config['PASSWORD']
 MAX_DAYS_BACK = config.get('MAX_DAYS_BACK', 10)  # Default to 10 if not in config
 MIN_DATE = config.get('MIN_DATE', '01/01/2025')  # Default to '01/01/2025' if not in config
 DOWNLOAD_ROOT_FOLDER = config.get('DOWNLOAD_ROOT_FOLDER', 'downloaded_images') # Default to 'downloaded_images' if not in config
+DOWNLOAD_MODE = config.get('DOWNLOAD_MODE', 'latest')  # 'latest' (single flat folder, YYYY-MM-DD_ prefix) or 'per_day' (one folder per date)
+LATEST_FOLDER_NAME = config.get('LATEST_FOLDER_NAME', 'latest')  # Override the 'latest/' folder name when DOWNLOAD_MODE='latest'
+ARCHIVE_OLD = config.get('ARCHIVE_OLD', True)  # When DOWNLOAD_MODE='latest', move files older than MAX_DAYS_BACK to ARCHIVE_FOLDER_NAME after crawling
+ARCHIVE_FOLDER_NAME = config.get('ARCHIVE_FOLDER_NAME', 'archive')  # Sibling of LATEST_FOLDER_NAME under DOWNLOAD_ROOT_FOLDER
+DOWNLOAD_IMAGES = bool(config.get('DOWNLOAD_IMAGES', True))
+DOWNLOAD_VIDEOS = bool(config.get('DOWNLOAD_VIDEOS', True))
+DOWNLOAD_NOTES = bool(config.get('DOWNLOAD_NOTES', True))
+
+if DOWNLOAD_MODE not in ('per_day', 'latest'):
+    raise SystemExit(f"Invalid DOWNLOAD_MODE: {DOWNLOAD_MODE!r}. Must be 'per_day' or 'latest'.")
+
+if DOWNLOAD_MODE == 'latest' and ARCHIVE_OLD and LATEST_FOLDER_NAME == ARCHIVE_FOLDER_NAME:
+    raise SystemExit("LATEST_FOLDER_NAME and ARCHIVE_FOLDER_NAME must differ when ARCHIVE_OLD is enabled.")
+
+try:
+    MIN_DATE_PARSED = datetime.strptime(MIN_DATE, '%d/%m/%Y').date()
+except ValueError as e:
+    raise SystemExit(f"Invalid MIN_DATE: {MIN_DATE!r}. Expected format dd/mm/yyyy. Error: {e}")
 
 # Global Configuration (these remain hardcoded as they're not intended for config file)
 LOGIN_URL = 'https://' + DOMAIN + '.mybabysdays.com/user/home'
 IMAGE_BASE = '/images/sted/gallery_image/'
 VIDEO_BASE = f'mybabysdays.com/video_path/'
-HOME_PAGE_URL = 'https://' + DOMAIN + '.mybabysdays.com/component/sted_parent/diary/main'
+HOME_PAGE_URL = 'https://' + DOMAIN + '.mybabysdays.com/component/sted_parent/feed/main'
+AJAX_ROWS_URL = 'https://' + DOMAIN + '.mybabysdays.com/index.php?components=com_sted&option=com_sted_parent&controller=feed&task=ajax_rows'
 
 session = requests.Session()
 session.headers.update({
@@ -108,21 +128,67 @@ def download_media_file(media_url, filepath, page_url):
 def clean_folder_name(name):
     return re.sub(r'[\\/*?:"<>|]', "_", name)
 
-def extract_and_reformat_date(text):
-    # Match date pattern like '2nd March 2025'
-    match = re.search(
-        r'(\d{1,2})(st|nd|rd|th)?\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})',
-        text)
 
-    if not match:
-        raise ValueError("No valid date found in input")
+def media_destination(media_url, date_str):
+    """Return (folder, filepath) for a given media URL and ISO date, honouring DOWNLOAD_MODE."""
+    filename = os.path.basename(urlparse(media_url).path)
+    if DOWNLOAD_MODE == 'latest':
+        folder = os.path.join(DOWNLOAD_ROOT_FOLDER, clean_folder_name(LATEST_FOLDER_NAME))
+        filepath = os.path.join(folder, f"{date_str}_{filename}")
+    else:
+        folder = os.path.join(DOWNLOAD_ROOT_FOLDER, clean_folder_name(date_str))
+        filepath = os.path.join(folder, filename)
+    return folder, filepath
 
-    day, _, month, year = match.groups()
-    clean_date = f"{day} {month} {year}"
 
-    # Parse and format
-    parsed_date = datetime.strptime(clean_date, '%d %B %Y')
-    return parsed_date.strftime('%Y-%m-%d')
+def notes_destination(date_str):
+    """Return (folder, filepath) for the daily-notes file for an ISO date, honouring DOWNLOAD_MODE."""
+    if DOWNLOAD_MODE == 'latest':
+        folder = os.path.join(DOWNLOAD_ROOT_FOLDER, clean_folder_name(LATEST_FOLDER_NAME))
+        filepath = os.path.join(folder, f"{date_str}_notes.txt")
+    else:
+        folder = os.path.join(DOWNLOAD_ROOT_FOLDER, clean_folder_name(date_str))
+        filepath = os.path.join(folder, "notes.txt")
+    return folder, filepath
+
+
+_NOTE_ID_MARKER_RE = re.compile(r'^# Daily Note (\d+)\b', re.MULTILINE)
+
+
+def save_notes_for_date(date_str, notes):
+    """Append any not-yet-recorded notes for `date_str` to its notes file.
+
+    Each note is delimited by a `# Daily Note <id>` marker line so subsequent runs can
+    skip notes already on disk. Returns the number of notes newly written.
+    """
+    if not notes:
+        return 0
+    folder, filepath = notes_destination(date_str)
+
+    existing_ids = set()
+    file_exists = os.path.exists(filepath)
+    if file_exists:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            existing_ids = set(_NOTE_ID_MARKER_RE.findall(f.read()))
+
+    new_notes = [n for n in notes if n.get('id') and n['id'] not in existing_ids]
+    if not new_notes:
+        return 0
+
+    os.makedirs(folder, exist_ok=True)
+    with open(filepath, 'a' if file_exists else 'w', encoding='utf-8') as f:
+        for i, note in enumerate(new_notes):
+            if file_exists or i > 0:
+                f.write('\n\n')
+            f.write(f"# Daily Note {note['id']}")
+            if note.get('posted'):
+                f.write(f" — {note['posted']}")
+            f.write('\n\n')
+            f.write(note['body'])
+            f.write('\n')
+            file_exists = True
+    return len(new_notes)
+
 
 def login():
     try:
@@ -190,94 +256,264 @@ def login():
     return response
 
 
-def download_media_from_page(url):
-    print(f"Processing: {url}")
-    try:
-        response = session.get(url, timeout=10)
-        response.raise_for_status()
-    except requests.exceptions.ConnectionError as e:
-        print(f"Warning: Failed to connect to {url}. Skipping this page. Error: {e}")
-        return None
-    except requests.exceptions.HTTPError as e:
-        print(f"Warning: HTTP error accessing {url}. Skipping this page. Error: {e}")
-        return None
-    except requests.exceptions.Timeout:
-        print(f"Warning: Connection to {url} timed out. Skipping this page.")
-        return None
+def _extract_note_from_block(block):
+    """Return {'id', 'posted', 'body'} for a 'Daily Note was added' block, or None.
 
-    soup = BeautifulSoup(response.text, 'html.parser')
-
-    title = soup.title.string if soup.title else "Untitled"
-    try:
-        formatted_date = extract_and_reformat_date(title.strip())
-    except ValueError as e:
-        print(f"Warning: Could not extract date from page title '{title}'. Skipping this page. Error: {e}")
+    Only matches the "added" event (not edits/comments). The body is taken from the
+    hidden .extraBlock div (full text behind 'Show more...'); falls back to the visible
+    .extraInfo if extraBlock is missing.
+    """
+    h2 = block.find('h2')
+    if not h2:
+        return None
+    h2_text = h2.get_text(' ', strip=True)
+    if "'Daily Note'" not in h2_text or 'was added' not in h2_text:
         return None
 
-    folder_name = clean_folder_name(formatted_date)
-    download_location = os.path.join(DOWNLOAD_ROOT_FOLDER, folder_name)
+    note_id = block.get('data-id') or ''
 
-    os.makedirs(DOWNLOAD_ROOT_FOLDER, exist_ok=True)
+    target = block.find('div', class_='extraBlock')
+    if target is None:
+        target = block.find('div', class_='extraInfo')
+        if target is not None:
+            for a in target.find_all('a', class_='showMore'):
+                a.decompose()
+    if target is None:
+        body = ''
+    else:
+        for br in target.find_all('br'):
+            br.replace_with('\n')
+        body = target.get_text()
+    body = re.sub(r'[ \t]+\n', '\n', body)
+    body = re.sub(r'\n{3,}', '\n\n', body).strip()
 
-    # Use links as the larger sized image is linked
-    all_links = soup.find_all('a')
+    posted = ''
+    vd = block.find('span', class_='vertical-date')
+    if vd:
+        posted = vd.get_text(' ', strip=True)
+
+    return {'id': note_id, 'posted': posted, 'body': body}
+
+
+def parse_feed_chunk(html, page_url):
+    """
+    Parse a feed page or AJAX-rows response.
+
+    Returns (by_date, cursor):
+      - by_date: dict {YYYY-MM-DD: {'media': [url, ...], 'notes': [{...}, ...]}}, in document order.
+        Media collection respects DOWNLOAD_IMAGES / DOWNLOAD_VIDEOS; notes only present when
+        DOWNLOAD_NOTES is enabled.
+      - cursor: dict with 'lastDate', 'lastid', 'rowCount', 'itemCount' from the
+        last hidden inputs in the chunk (empty if none)
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+
+    by_date = {}
+
+    def entry_for(date_str):
+        return by_date.setdefault(date_str, {'media': [], 'notes': []})
+
+    if DOWNLOAD_IMAGES or DOWNLOAD_VIDEOS:
+        def media_match(h):
+            if not h:
+                return False
+            if DOWNLOAD_IMAGES and h.startswith(IMAGE_BASE):
+                return True
+            if DOWNLOAD_VIDEOS and VIDEO_BASE in h:
+                return True
+            return False
+
+        for link in soup.find_all('a', href=media_match):
+            row = link.find_previous('div', class_='feed-date-row')
+            if not row or not row.has_attr('data-date'):
+                # AJAX responses may start with timeline blocks belonging to a previous date,
+                # but the script always issues the request from a fresh feed page so the
+                # initial-page case is what matters here. Skip orphaned blocks.
+                continue
+            href = link['href']
+            media_url = urljoin(page_url, href) if href.startswith(IMAGE_BASE) else href
+            entry_for(row['data-date'])['media'].append(media_url)
+
+    if DOWNLOAD_NOTES:
+        for block in soup.find_all('div', class_='vertical-timeline-block'):
+            note = _extract_note_from_block(block)
+            if not note:
+                continue
+            row = block.find_previous('div', class_='feed-date-row')
+            if not row or not row.has_attr('data-date'):
+                continue
+            entry_for(row['data-date'])['notes'].append(note)
+
+    cursor = {}
+    for name in ('lastDate', 'lastid', 'rowCount', 'itemCount'):
+        inputs = soup.find_all('input', {'name': name})
+        if inputs:
+            cursor[name] = inputs[-1].get('value')
+
+    return by_date, cursor
+
+
+def download_for_date(date_str, entry):
+    media_urls = entry.get('media', [])
+    notes = entry.get('notes', [])
 
     count = 0
-    for link in all_links:
-        #handle a missing href
-        if not link.has_attr('href'):
+    skipped = 0
+    for media_url in media_urls:
+        folder, filepath = media_destination(media_url, date_str)
+        if os.path.exists(filepath):
+            skipped += 1
+            continue
+        os.makedirs(folder, exist_ok=True)
+        if download_media_file(media_url, filepath, HOME_PAGE_URL):
+            count += 1
+
+    notes_written = save_notes_for_date(date_str, notes) if notes else 0
+
+    parts = []
+    if media_urls:
+        parts.append(f"media: downloaded {count}, already had {skipped}")
+    if notes:
+        parts.append(f"notes: wrote {notes_written}, already had {len(notes) - notes_written}")
+    if parts:
+        print(f"{date_str}: " + "; ".join(parts))
+
+
+def process_chunk(by_date):
+    """Download media for each date. Returns True if a stop condition was hit."""
+    today = date.today()
+    for date_str in sorted(by_date.keys(), reverse=True):
+        try:
+            row_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            print(f"Info: row date '{row_date}'")
+        except ValueError:
+            print(f"Warning: unexpected date value '{date_str}', skipping.")
             continue
 
-        # Parse links, and download if it's a gallery image
-        href = link['href']
-        if (href.startswith(IMAGE_BASE) or VIDEO_BASE in href):
-            if href.startswith(IMAGE_BASE):
-                media_url = urljoin(url, href) # Link for images doesn't include base
-            else:
-                media_url = href # Link for videos has whole other subdomain
+        if row_date < MIN_DATE_PARSED:
+            print(f"Hit MIN_DATE ({MIN_DATE}). Stopping.")
+            return True
 
-            filename = os.path.basename(urlparse(media_url).path)
-            filepath = os.path.join(download_location, filename)
+        days_back = (today - row_date).days
+        if MAX_DAYS_BACK and days_back > MAX_DAYS_BACK:
+            print(f"Reached MAX_DAYS_BACK ({MAX_DAYS_BACK} days). Stopping. Next day with items is {row_date} ({days_back} days back).")
+            return True
 
-            #Create dir if not exists
-            os.makedirs(download_location, exist_ok=True)
+        download_for_date(date_str, by_date[date_str])
+    return False
 
-            if not os.path.exists(filepath):
-                if download_media_file(media_url, filepath, url):
-                    count += 1
 
-    print(f"Downloaded {count} media file(s) to {folder_name}")
+def crawl_media():
+    print(f"Fetching {HOME_PAGE_URL}")
+    try:
+        response = session.get(HOME_PAGE_URL, timeout=15)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"Fatal: failed to load feed page: {e}")
+        return
 
-    # Find "Prev" button, get URL
-    prev_link = soup.find('a', title="View the Previous Month.")
-    if prev_link and 'href' in prev_link.attrs:
-        next_page_url = urljoin(url, prev_link['href'])
-        return next_page_url
+    by_date, cursor = parse_feed_chunk(response.text, HOME_PAGE_URL)
+    if not by_date:
+        print("Warning: no items found on the initial feed page.")
+        return
 
-    return None
+    if process_chunk(by_date):
+        return
 
-def crawl_media(start_url):
-    next_url = start_url
-    hit_min_date = False
-    days_back = 0
-    while (next_url
-           and (days_back <= MAX_DAYS_BACK
-                or MAX_DAYS_BACK == 0
-           )
-    ):
-        if MIN_DATE in next_url: hit_min_date = True
-
-        next_url = download_media_from_page(next_url)
-        days_back += 1
-
-        if hit_min_date:
-            print(f"Hit MIN_DATE: {MIN_DATE}")
+    # Walk back via the same AJAX endpoint the "Load More" button uses.
+    while cursor.get('lastDate') and cursor.get('lastid'):
+        try:
+            row_count = int(cursor.get('rowCount', 0))
+            item_count = int(cursor.get('itemCount', 0))
+        except (TypeError, ValueError):
             break
+        if row_count and item_count and row_count <= item_count:
+            print("Reached end of feed.")
+            break
+
+        payload = {
+            'action': '',
+            'lastDate': cursor['lastDate'],
+            'lastID': cursor['lastid'],
+            'rowCount': cursor.get('rowCount', ''),
+        }
+        try:
+            response = session.post(
+                AJAX_ROWS_URL,
+                data=payload,
+                timeout=15,
+                headers={
+                    'Referer': HOME_PAGE_URL,
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            print(f"Warning: failed to load more rows: {e}")
+            break
+
+        if not response.text.strip():
+            print("Empty AJAX response. Stopping.")
+            break
+
+        by_date, cursor = parse_feed_chunk(response.text, HOME_PAGE_URL)
+        if not by_date:
+            print("No more items in feed. Stopping.")
+            break
+
+        if process_chunk(by_date):
+            return
+
+
+_LATEST_PREFIX_RE = re.compile(r'^(\d{4}-\d{2}-\d{2})_')
+
+
+def archive_old_from_latest():
+    """Move files in <root>/<LATEST_FOLDER_NAME>/ whose YYYY-MM-DD_ prefix is older than
+    MAX_DAYS_BACK days into <root>/<ARCHIVE_FOLDER_NAME>/. No-op when DOWNLOAD_MODE!='latest',
+    when archiving is disabled, or when MAX_DAYS_BACK==0 (unbounded crawl)."""
+    if DOWNLOAD_MODE != 'latest' or not ARCHIVE_OLD or not MAX_DAYS_BACK:
+        return
+
+    latest_folder = os.path.join(DOWNLOAD_ROOT_FOLDER, clean_folder_name(LATEST_FOLDER_NAME))
+    if not os.path.isdir(latest_folder):
+        return
+
+    archive_folder = os.path.join(DOWNLOAD_ROOT_FOLDER, clean_folder_name(ARCHIVE_FOLDER_NAME))
+    today = date.today()
+    moved = 0
+    for filename in os.listdir(latest_folder):
+        src = os.path.join(latest_folder, filename)
+        if not os.path.isfile(src):
+            continue
+        match = _LATEST_PREFIX_RE.match(filename)
+        if not match:
+            continue
+        try:
+            file_date = datetime.strptime(match.group(1), '%Y-%m-%d').date()
+        except ValueError:
+            continue
+        if (today - file_date).days <= MAX_DAYS_BACK:
+            continue
+
+        os.makedirs(archive_folder, exist_ok=True)
+        dst = os.path.join(archive_folder, filename)
+        if os.path.exists(dst):
+            # Already in archive (e.g. ran twice) — drop the duplicate from latest.
+            os.remove(src)
+        else:
+            shutil.move(src, dst)
+        moved += 1
+
+    if moved:
+        print(f"Archived {moved} file(s) older than {MAX_DAYS_BACK} day(s) into {archive_folder}")
+
 
 if __name__ == '__main__':
     try:
         login()
-        crawl_media(HOME_PAGE_URL)
+        crawl_media()
+        archive_old_from_latest()
     except ConnectionError as e:
         print(f"Fatal Connection Error: {e}")
     except CredentialError as e:
