@@ -182,3 +182,5 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 config.json
+/CLAUDE.md
+/.python-version
