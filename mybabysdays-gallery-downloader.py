@@ -243,6 +243,24 @@ def login():
     # Check for elements present on the post-login page, and absence of login form
     response_soup = BeautifulSoup(response.text, 'html.parser')
     if "logout" not in response.text.lower() and "dashboard" not in response.text.lower(): # Assuming "dashboard" appears on successful login
+        # The site may interpose a "verify your email" two-factor step after login.
+        # It ships a "Skip" link that isn't server-side gated (the countdown/disabled
+        # state is JS-only), so following it directly completes the login.
+        skip_link = response_soup.find('a', id='skipBtn')
+        if skip_link and skip_link.get('href'):
+            skip_url = urljoin(response.url, skip_link.get('href'))
+            try:
+                response = session.get(skip_url, timeout=10)
+                response.raise_for_status()
+            except requests.exceptions.ConnectionError as e:
+                raise ConnectionError(f"Failed to connect to {skip_url} while bypassing two-factor verification. Error: {e}")
+            except requests.exceptions.HTTPError as e:
+                raise Exception(f"HTTP error while bypassing two-factor verification: {e}")
+            except requests.exceptions.Timeout:
+                raise ConnectionError(f"Connection to {skip_url} timed out while bypassing two-factor verification.")
+            response_soup = BeautifulSoup(response.text, 'html.parser')
+
+    if "logout" not in response.text.lower() and "dashboard" not in response.text.lower():
         # If the login form is still present, it likely means login failed
         if response_soup.find('form') and response_soup.find('form').find('input', {'name': 'username'}):
             raise CredentialError("Login failed. Incorrect username or password, or an issue with the login process.")
